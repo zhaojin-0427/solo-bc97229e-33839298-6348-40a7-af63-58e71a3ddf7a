@@ -37,6 +37,7 @@
     .s-published { background: #dcfce7; color: #166534; }
     .s-failed { background: #fee2e2; color: #991b1b; }
     .s-cancelled { background: #f3f4f6; color: #4b5563; }
+    .s-reclaimed { background: #e5e7eb; color: #374151; }
     .msg { color: #6b7280; font-size: 12px; margin-top: 3px; max-width: 320px; }
     .actions form { display: inline; }
     .mono { font-family: ui-monospace, monospace; font-size: 12px; }
@@ -48,7 +49,8 @@
   <header>
     <h1>质检数据采集服务</h1>
     <p>后台经 Playwright 操作旧仪器门户，单会话串行执行；校验通过后发布到质量库。
-       模拟门户：<a class="ext" style="color:#a7f3d0" href="{{ portal_url }}/" target="_blank">{{ portal_url }}</a></p>
+       模拟门户：<a class="ext" style="color:#a7f3d0" href="{{ portal_url }}/" target="_blank">{{ portal_url }}</a>
+       ｜ <a class="ext" style="color:#a7f3d0" href="/reclaim">文件回收页 →</a></p>
   </header>
   <main>
     <section class="card">
@@ -90,15 +92,21 @@
             </td>
             <td>{{ t.line }}<div class="msg">{{ t.date }}</div></td>
             <td>
+              {% if t.reclaimed_at %}
+              <span class="status s-reclaimed">已回收</span>
+              <div class="msg">原文件已回收，仅保留采集记录；回收单 {{ (t.reclaim_job_id or '')[:8] }}</div>
+              {% else %}
               <span class="status s-{{ t.status }}">
                 {{ {'queued':'排队中','running':'执行中','cancelling':'取消中',
                     'published':'已发布','failed':'失败','cancelled':'已取消'}[t.status] }}
               </span>
+              {% endif %}
               <div class="msg">{{ t.message }}</div>
             </td>
             <td>{{ t.attempts }}</td>
             <td class="mono" style="font-size:12px">{{ t.created_at.replace('T',' ').replace('+00:00',' UTC') }}</td>
             <td class="actions">
+              {% if not t.reclaimed_at %}
               {% if t.status in ('queued', 'running', 'cancelling') %}
               <form method="post" action="/api/tasks/{{ t.id }}/cancel">
                 <input type="hidden" name="html" value="1">
@@ -115,6 +123,9 @@
               <a href="/tasks/{{ t.id }}/download">
                 <button class="btn-gray" type="button">下载 CSV</button>
               </a>
+              {% endif %}
+              {% else %}
+              <span class="hint">下载已关闭</span>
               {% endif %}
             </td>
           </tr>

@@ -9,11 +9,6 @@ import threading
 import time
 from pathlib import Path
 
-from playwright.sync_api import (
-    TimeoutError as PlaywrightTimeoutError,
-    sync_playwright,
-)
-
 from . import config
 
 
@@ -42,6 +37,9 @@ class PortalBot:
 
     # ---- 生命周期 -------------------------------------------------------
     def _start(self) -> None:
+        # 惰性导入：无浏览器环境（如单元测试/纯 Web 演示）也能导入本模块。
+        from playwright.sync_api import sync_playwright
+
         self._pw = sync_playwright().start()
         if config.BROWSER_CDP_URL:
             # 容器内：连接独立 Chromium 容器的 CDP 端点。
@@ -114,6 +112,8 @@ class PortalBot:
 
     def _export_and_save(self) -> Path:
         """点击导出并取消感知地等待下载，落盘到任务工作目录。"""
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
         self._check_cancel()
         page = self._page
         collected: list = []

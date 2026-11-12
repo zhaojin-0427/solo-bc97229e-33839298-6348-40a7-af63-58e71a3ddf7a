@@ -30,5 +30,9 @@ OPERATION_TIMEOUT_MS = int(_env("OPERATION_TIMEOUT_MS", "30000"))
 DOWNLOAD_TICK_SECONDS = float(_env("DOWNLOAD_TICK_SECONDS", "0.25"))
 NAV_TIMEOUT_MS = int(_env("NAV_TIMEOUT_MS", "15000"))
 
+# 文件回收：后台清理线程轮询间隔，以及流式下载分块大小。
+RECLAIM_POLL_SECONDS = float(_env("RECLAIM_POLL_SECONDS", "0.5"))
+DOWNLOAD_CHUNK_BYTES = int(_env("DOWNLOAD_CHUNK_BYTES", str(64 * 1024)))
+
 # 质量库 CSV 表头
 CSV_HEADER = ["产线", "日期", "样品号", "测量值"]

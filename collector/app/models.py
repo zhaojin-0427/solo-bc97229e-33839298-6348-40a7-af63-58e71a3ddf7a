@@ -21,6 +21,11 @@ ACTIVE_STATES = ("queued", "running", "cancelling")
 FINAL_STATES = ("published", "failed", "cancelled")
 RETRYABLE_STATES = ("failed", "cancelled")
 
+# 回收项状态机：
+#   pending（待清理）-> cleaning（清理中）-> done（完成）
+#                                   \-> error（错误，可重试回到 pending）
+RECLAIM_ITEM_STATES = ("pending", "cleaning", "done", "error")
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id              TEXT PRIMARY KEY,
@@ -37,7 +42,40 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at);
+
+-- 回收单：一次「预览 -> 确认」的固定范围（产线 + 检测日期上界）。
+CREATE TABLE IF NOT EXISTS reclaim_jobs (
+    id           TEXT PRIMARY KEY,
+    line         TEXT NOT NULL,             -- 预览时选定的产线，空串表示全部产线
+    date_upper   TEXT NOT NULL,             -- 检测日期上界（含）
+    status       TEXT NOT NULL,             -- preview / confirmed
+    note         TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    confirmed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reclaim_jobs_status ON reclaim_jobs(status);
+
+-- 回收项：预览瞬间快照固定的任务，确认后只处理这些行，之后新发布的任务不纳入。
+CREATE TABLE IF NOT EXISTS reclaim_items (
+    job_id         TEXT NOT NULL,
+    task_id        TEXT NOT NULL,
+    line           TEXT NOT NULL,
+    date           TEXT NOT NULL,
+    published_file TEXT,
+    status         TEXT NOT NULL,
+    error          TEXT NOT NULL DEFAULT '',
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    updated_at     TEXT,
+    PRIMARY KEY (job_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reclaim_items_status ON reclaim_items(status);
 """
+
+# 旧库增量迁移：为 tasks 补充回收标记列。
+_TASK_MIGRATIONS = (
+    ("reclaimed_at", "ALTER TABLE tasks ADD COLUMN reclaimed_at TEXT"),
+    ("reclaim_job_id", "ALTER TABLE tasks ADD COLUMN reclaim_job_id TEXT"),
+)
 
 
 def _now() -> str:
@@ -57,9 +95,20 @@ class TaskStore:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate_tasks()
         self._conn.commit()
         # 进程内取消事件：worker 轮询它来中断浏览器操作。
         self._cancel_events: dict[str, threading.Event] = {}
+
+    def _migrate_tasks(self) -> None:
+        """对旧版数据库增量加列，保留既有任务与回收元数据。"""
+        existing = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        for column, ddl in _TASK_MIGRATIONS:
+            if column not in existing:
+                self._conn.execute(ddl)
 
     # ---- 基础工具 -------------------------------------------------------
     @property
@@ -176,6 +225,255 @@ class TaskStore:
             )
             self._conn.commit()
             return cur.rowcount
+
+    # ---- 文件回收 -------------------------------------------------------
+    def preview_reclaim(self, line: str, date_upper: str) -> tuple[dict, list[dict]]:
+        """按产线 + 检测日期上界（含）快照符合条件的已发布任务，生成预览单。
+
+        范围在预览瞬间固定：回收项写入后不再变化，确认后只处理这些任务，
+        预览之后新发布的文件不会被纳入。同一时刻只允许一个待确认预览单。
+        """
+        existing = self.get_pending_preview_job()
+        if existing is not None:
+            raise ValueError("已有待确认的回收预览，请先确认或取消后再试")
+        job_id = uuid.uuid4().hex
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO reclaim_jobs (id, line, date_upper, status, created_at)"
+                " VALUES (?, ?, ?, 'preview', ?)",
+                (job_id, line, date_upper, _now()),
+            )
+            if line:
+                sql = (
+                    "SELECT * FROM tasks WHERE status = 'published'"
+                    " AND reclaimed_at IS NULL AND line = ? AND date <= ?"
+                    " AND NOT EXISTS ("
+                    "  SELECT 1 FROM reclaim_items ri WHERE ri.task_id = tasks.id)"
+                    " ORDER BY date ASC, line ASC, created_at ASC"
+                )
+                params: tuple = (line, date_upper)
+            else:
+                sql = (
+                    "SELECT * FROM tasks WHERE status = 'published'"
+                    " AND reclaimed_at IS NULL AND date <= ?"
+                    " AND NOT EXISTS ("
+                    "  SELECT 1 FROM reclaim_items ri WHERE ri.task_id = tasks.id)"
+                    " ORDER BY date ASC, line ASC, created_at ASC"
+                )
+                params = (date_upper,)
+            rows = self._conn.execute(sql, params).fetchall()
+            items = [dict(r) for r in rows]
+            for t in items:
+                self._conn.execute(
+                    "INSERT INTO reclaim_items"
+                    " (job_id, task_id, line, date, published_file, status, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+                    (job_id, t["id"], t["line"], t["date"],
+                     t["published_file"], _now()),
+                )
+            self._conn.commit()
+        # 返回回收项视图（键名与回收项表一致），保持预览/明细字段统一。
+        return self.get_reclaim_job(job_id), self.list_reclaim_items(job_id)
+
+    def get_pending_preview_job(self) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM reclaim_jobs WHERE status = 'preview'"
+                " ORDER BY created_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_reclaim_job(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM reclaim_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            job = dict(row)
+            items = self._conn.execute(
+                "SELECT * FROM reclaim_items WHERE job_id = ?"
+                " ORDER BY date ASC, line ASC, task_id ASC",
+                (job_id,),
+            ).fetchall()
+            job["items"] = [dict(r) for r in items]
+            counts: dict[str, int] = {s: 0 for s in RECLAIM_ITEM_STATES}
+            for it in job["items"]:
+                counts[it["status"]] += 1
+            job["counts"] = counts
+            return job
+
+    def list_reclaim_jobs(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM reclaim_jobs ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            jobs = []
+            for row in rows:
+                job = dict(row)
+                counts = {
+                    r["status"]: r["n"]
+                    for r in self._conn.execute(
+                        "SELECT status, COUNT(*) AS n FROM reclaim_items"
+                        " WHERE job_id = ? GROUP BY status",
+                        (job["id"],),
+                    ).fetchall()
+                }
+                job["counts"] = {s: counts.get(s, 0) for s in RECLAIM_ITEM_STATES}
+                jobs.append(job)
+            return jobs
+
+    def list_reclaim_items(self, job_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM reclaim_items WHERE job_id = ?"
+                " ORDER BY date ASC, line ASC, task_id ASC",
+                (job_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def cancel_reclaim_job(self, job_id: str) -> tuple[bool, str]:
+        """取消尚未确认的预览单：删除快照项，任务恢复可回收状态。"""
+        with self._lock:
+            job = self.get_reclaim_job(job_id)
+            if job is None:
+                return False, "回收单不存在"
+            if job["status"] != "preview":
+                return False, "回收单已确认，无法取消"
+            self._conn.execute(
+                "DELETE FROM reclaim_items WHERE job_id = ?", (job_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM reclaim_jobs WHERE id = ?", (job_id,)
+            )
+            self._conn.commit()
+            return True, "预览已取消，未改动任何任务"
+
+    def confirm_reclaim_job(self, job_id: str) -> tuple[dict | None, str]:
+        """确认回收：原子地把预览项固定的任务一起标记为已回收。
+
+        确认后这些任务立即拒绝新下载；后台清理另行异步执行，确认不被慢删除阻塞。
+        """
+        with self._lock:
+            job = self.get_reclaim_job(job_id)
+            if job is None:
+                return None, "回收单不存在"
+            if job["status"] != "preview":
+                return None, "回收单已确认，不能重复确认"
+            if not job["items"]:
+                return None, "预览范围为空，没有可回收任务"
+            stamp = _now()
+            self._conn.execute(
+                "UPDATE reclaim_jobs SET status = 'confirmed', confirmed_at = ?"
+                " WHERE id = ?",
+                (stamp, job_id),
+            )
+            # 只标记预览快照里的任务；之后新发布的任务不受影响。
+            self._conn.executemany(
+                "UPDATE tasks SET reclaimed_at = ?, reclaim_job_id = ? WHERE id = ?",
+                [(stamp, job_id, it["task_id"]) for it in job["items"]],
+            )
+            self._conn.commit()
+            return self.get_reclaim_job(job_id), "回收已受理，所选任务已标记为已回收"
+
+    def reclaim_pending_items(self, limit: int = 5) -> list[dict[str, Any]]:
+        """取已确认回收单中待清理的项，供后台清理线程认领。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ri.* FROM reclaim_items ri"
+                " JOIN reclaim_jobs rj ON rj.id = ri.job_id"
+                " WHERE rj.status = 'confirmed' AND ri.status = 'pending'"
+                " ORDER BY rj.created_at ASC, ri.date ASC, ri.task_id ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_reclaim_item_cleaning(self, job_id: str, task_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE reclaim_items SET status = 'cleaning',"
+                " attempts = attempts + 1, updated_at = ?"
+                " WHERE job_id = ? AND task_id = ?",
+                (_now(), job_id, task_id),
+            )
+            self._conn.commit()
+
+    def mark_reclaim_item_done(self, job_id: str, task_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE reclaim_items SET status = 'done', error = '', updated_at = ?"
+                " WHERE job_id = ? AND task_id = ?",
+                (_now(), job_id, task_id),
+            )
+            self._conn.commit()
+
+    def mark_reclaim_item_error(self, job_id: str, task_id: str, message: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE reclaim_items SET status = 'error', error = ?, updated_at = ?"
+                " WHERE job_id = ? AND task_id = ?",
+                (message[:500], _now(), job_id, task_id),
+            )
+            self._conn.commit()
+
+    def retry_reclaim_item(self, job_id: str, task_id: str) -> tuple[bool, str]:
+        """单项重试：错误态回到待清理。任务保持已回收，下载不会恢复。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM reclaim_items WHERE job_id = ? AND task_id = ?",
+                (job_id, task_id),
+            ).fetchone()
+            if row is None:
+                return False, "回收项不存在"
+            if row["status"] != "error":
+                return False, "仅错误状态的回收项可以重试"
+            self._conn.execute(
+                "UPDATE reclaim_items SET status = 'pending', error = '', updated_at = ?"
+                " WHERE job_id = ? AND task_id = ?",
+                (_now(), job_id, task_id),
+            )
+            self._conn.commit()
+            return True, "已重新加入清理队列"
+
+    def retry_reclaim_job_errors(self, job_id: str) -> tuple[bool, str]:
+        with self._lock:
+            job = self.get_reclaim_job(job_id)
+            if job is None:
+                return False, "回收单不存在"
+            if job["counts"]["error"] == 0:
+                return False, "该回收单没有错误项"
+            self._conn.execute(
+                "UPDATE reclaim_items SET status = 'pending', error = '', updated_at = ?"
+                " WHERE job_id = ? AND status = 'error'",
+                (_now(), job_id),
+            )
+            self._conn.commit()
+            return True, "全部错误项已重新加入清理队列"
+
+    def recover_reclaim_state(self) -> int:
+        """重启恢复：清理中断的项回到待清理，并修复回收标记，绝不恢复下载。"""
+        fixed = 0
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE reclaim_items SET status = 'pending', updated_at = ?"
+                " WHERE status = 'cleaning'",
+                (_now(),),
+            )
+            fixed += cur.rowcount
+            # 已确认回收单中的任务必须保持已回收标记（防止确认事务半提交导致漏标）。
+            cur = self._conn.execute(
+                "UPDATE tasks SET reclaimed_at = COALESCE(reclaimed_at, ?),"
+                " reclaim_job_id = ri.job_id"
+                " FROM reclaim_items ri"
+                " JOIN reclaim_jobs rj ON rj.id = ri.job_id"
+                " WHERE tasks.id = ri.task_id AND rj.status = 'confirmed'"
+                " AND tasks.reclaimed_at IS NULL",
+                (_now(),),
+            )
+            fixed += cur.rowcount
+            self._conn.commit()
+        return fixed
 
     def close(self) -> None:
         with self._lock:

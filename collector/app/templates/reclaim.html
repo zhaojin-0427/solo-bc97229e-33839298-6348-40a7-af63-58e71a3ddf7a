@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文件回收 - 质检数据采集服务</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+           background: #f3f4f6; color: #1f2937; }
+    header { background: #0f766e; color: #fff; padding: 16px 32px; }
+    header h1 { margin: 0; font-size: 19px; }
+    header p { margin: 4px 0 0; font-size: 13px; color: #ccfbf1; }
+    main { max-width: 1120px; margin: 26px auto; }
+    .card { background: #fff; border-radius: 10px; padding: 22px 26px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.08); margin-bottom: 22px; }
+    h2 { font-size: 16px; margin: 0 0 14px; }
+    label { font-size: 13px; color: #374151; display: block; margin-bottom: 4px; }
+    input, select { padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px;
+                    font-size: 14px; min-width: 200px; }
+    .row { display: flex; gap: 18px; align-items: flex-end; flex-wrap: wrap; }
+    button { border: 0; border-radius: 6px; padding: 8px 16px; font-size: 13px;
+             cursor: pointer; }
+    .btn-primary { background: #0f766e; color: #fff; }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-warn { background: #d97706; color: #fff; }
+    .btn-gray { background: #4b5563; color: #fff; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid #e5e7eb; padding: 9px 8px; text-align: left;
+             vertical-align: top; }
+    th { background: #f9fafb; font-weight: 600; }
+    .status { display: inline-block; padding: 2px 10px; border-radius: 999px;
+              font-size: 12px; white-space: nowrap; }
+    .s-pending { background: #e0e7ff; color: #3730a3; }
+    .s-cleaning { background: #dbeafe; color: #1e40af; }
+    .s-done { background: #dcfce7; color: #166534; }
+    .s-error { background: #fee2e2; color: #991b1b; }
+    .s-preview { background: #fef9c3; color: #854d0e; }
+    .s-confirmed { background: #dcfce7; color: #166534; }
+    .msg { color: #6b7280; font-size: 12px; margin-top: 3px; max-width: 360px; }
+    .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+    .hint { font-size: 12px; color: #6b7280; margin-top: 10px; line-height: 1.7; }
+    a.ext { color: #0f766e; }
+    .counts span { display: inline-block; margin-right: 10px; font-size: 12px; }
+    .actions form { display: inline; }
+    .empty { text-align: center; color: #9ca3af; padding: 24px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>检测 CSV 文件回收</h1>
+    <p>按产线与检测日期上界预览已发布任务 → 确认回收。范围在预览瞬间固定，
+       确认后只回收所选任务；后台异步删除文件，任务元数据与采集入口保留。
+       ｜ <a class="ext" style="color:#a7f3d0" href="/">← 返回采集首页</a></p>
+  </header>
+  <main>
+    <section class="card">
+      <h2>1. 选择回收范围（产线 + 检测日期上界，含当天）</h2>
+      <form method="post" action="/api/reclaim/preview">
+        <input type="hidden" name="html" value="1">
+        <div class="row">
+          <div>
+            <label>产线</label>
+            <select name="line">
+              <option value="">全部产线</option>
+              <option value="A线">A线</option>
+              <option value="B线">B线</option>
+              <option value="C线">C线</option>
+            </select>
+          </div>
+          <div>
+            <label>检测日期上界</label>
+            <input type="date" name="date_upper" required>
+          </div>
+          <button class="btn-primary" type="submit">预览已发布任务</button>
+        </div>
+      </form>
+      <p class="hint">
+        仅列出「已发布且尚未回收」的任务；已在其他预览单中的任务不会重复出现。<br>
+        预览只做快照固定，不会改动任何文件；同一时刻只保留一个待确认预览。
+      </p>
+    </section>
+
+    {% if preview_job %}
+    <section class="card">
+      <h2>2. 待确认预览（范围已固定）</h2>
+      <p class="hint">
+        回收单 <span class="mono">{{ preview_job.id }}</span>
+        ｜ 产线：<b>{{ preview_job.line or '全部产线' }}</b>
+        ｜ 检测日期 ≤ <b>{{ preview_job.date_upper }}</b>
+        ｜ 预览时间：<span class="mono">{{ preview_job.created_at.replace('T',' ').replace('+00:00',' UTC') }}</span>
+      </p>
+      <table>
+        <thead>
+          <tr><th>任务</th><th>产线/日期</th><th>发布文件</th></tr>
+        </thead>
+        <tbody>
+        {% for t in preview_job['items'] %}
+          <tr>
+            <td class="mono">{{ t.task_id[:8] }}</td>
+            <td>{{ t.line }}<div class="msg">{{ t.date }}</div></td>
+            <td class="mono">{{ t.published_file }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="3" class="empty">该范围内没有可回收的已发布任务</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% if preview_job['items'] %}
+      <div class="row" style="margin-top:16px">
+        <form method="post" action="/api/reclaim/jobs/{{ preview_job.id }}/confirm">
+          <input type="hidden" name="html" value="1">
+          <button class="btn-danger" type="submit"
+                  onclick="return confirm('确认回收这 {{ preview_job["items"]|length }} 个任务？确认后立即拒绝新下载，后台删除文件且不可恢复。')">
+            确认回收（{{ preview_job['items']|length }} 项）
+          </button>
+        </form>
+        <form method="post" action="/api/reclaim/jobs/{{ preview_job.id }}/cancel">
+          <input type="hidden" name="html" value="1">
+          <button class="btn-gray" type="submit">取消预览</button>
+        </form>
+      </div>
+      <p class="hint">
+        确认后所选任务<b>一起标记为已回收并立即拒绝新下载</b>，其他任务照常运行；
+        确认前已开始的下载会完整返回，后台删除会等这些下载结束。
+      </p>
+      {% else %}
+      <form method="post" action="/api/reclaim/jobs/{{ preview_job.id }}/cancel" style="margin-top:12px">
+        <input type="hidden" name="html" value="1">
+        <button class="btn-gray" type="submit">关闭空预览</button>
+      </form>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    <section class="card">
+      <h2>3. 回收单与清理进度</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>回收单</th><th>范围</th><th>状态</th><th>进度</th><th>时间</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for job in jobs %}
+          <tr>
+            <td class="mono">{{ job.id[:8] }}</td>
+            <td>{{ job.line or '全部产线' }}<div class="msg">日期 ≤ {{ job.date_upper }}</div></td>
+            <td>
+              <span class="status s-{{ job.status }}">
+                {{ {'preview':'待确认','confirmed':'已确认'}[job.status] }}
+              </span>
+            </td>
+            <td class="counts">
+              <span class="status s-pending">待清理 {{ job.counts.pending }}</span>
+              <span class="status s-cleaning">清理中 {{ job.counts.cleaning }}</span>
+              <span class="status s-done">完成 {{ job.counts.done }}</span>
+              <span class="status s-error">错误 {{ job.counts.error }}</span>
+            </td>
+            <td class="mono" style="font-size:12px">
+              创建 {{ job.created_at.replace('T',' ').replace('+00:00',' UTC') }}
+              {% if job.confirmed_at %}<div class="msg">确认 {{ job.confirmed_at.replace('T',' ').replace('+00:00',' UTC') }}</div>{% endif %}
+            </td>
+            <td class="actions">
+              {% if job.status == 'confirmed' and job.counts.error > 0 %}
+              <form method="post" action="/api/reclaim/jobs/{{ job.id }}/retry-errors">
+                <input type="hidden" name="html" value="1">
+                <button class="btn-warn" type="submit">重试全部错误项</button>
+              </form>
+              {% endif %}
+              <a href="/api/reclaim/jobs/{{ job.id }}"><button class="btn-gray" type="button">明细 JSON</button></a>
+            </td>
+          </tr>
+          {% if job.status == 'confirmed' %}
+          <tr>
+            <td colspan="6" style="padding:0 8px">
+              <table style="margin:0 0 10px 18px; width:calc(100% - 18px)">
+                <thead>
+                  <tr><th>任务</th><th>产线/日期</th><th>文件</th><th>清理状态</th><th>错误信息 / 操作</th></tr>
+                </thead>
+                <tbody>
+                {% for it in job_details[job.id] %}
+                  <tr>
+                    <td class="mono">{{ it.task_id[:8] }}</td>
+                    <td>{{ it.line }}<div class="msg">{{ it.date }}</div></td>
+                    <td class="mono">{{ it.published_file or '—' }}</td>
+                    <td><span class="status s-{{ it.status }}">{{ item_labels[it.status] }}</span></td>
+                    <td>
+                      {% if it.error %}<div class="msg" style="max-width:none">{{ it.error }}（第 {{ it.attempts }} 次尝试）</div>{% endif %}
+                      {% if it.status == 'error' %}
+                      <form method="post" action="/api/reclaim/jobs/{{ job.id }}/items/{{ it.task_id }}/retry" style="margin-top:4px">
+                        <input type="hidden" name="html" value="1">
+                        <button class="btn-warn" type="submit">重试此项</button>
+                      </form>
+                      {% endif %}
+                    </td>
+                  </tr>
+                {% endfor %}
+                </tbody>
+              </table>
+            </td>
+          </tr>
+          {% endif %}
+        {% else %}
+          <tr><td colspan="6" class="empty">暂无回收单</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <p class="hint">
+        删除在后台执行：待清理 → 清理中 → 完成；失败显示错误并可重试。
+        进程中断后重启会继续清理（清理中的项自动回到待清理），已回收任务不会恢复下载。
+      </p>
+    </section>
+  </main>
+  <script>
+    // 有待确认预览，或已确认单仍有 待清理/清理中 项时，自动刷新进度。
+    const hasPreview = {{ 'true' if preview_job else 'false' }};
+    const confirmed = {{ (jobs | selectattr('status', 'equalto', 'confirmed') | list) | tojson }};
+    const hasCleaning = confirmed.some(j => (j.counts.pending + j.counts.cleaning) > 0);
+    if (hasPreview || hasCleaning) { setTimeout(() => window.location.reload(), 2500); }
+  </script>
+</body>
+</html>
