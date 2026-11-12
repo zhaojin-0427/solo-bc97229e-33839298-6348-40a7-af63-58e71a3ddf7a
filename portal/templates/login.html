@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}登录 - 旧仪器门户{% endblock %}
+{% block body %}
+<h2>门户登录</h2>
+<p style="color:#6b7280;font-size:13px">演示账号：admin / instrument123（全系统仅允许一个会话）</p>
+<form method="post" action="{{ url_for('login') }}">
+  <label>用户名</label>
+  <input name="username" autofocus required>
+  <label>密码</label>
+  <input name="password" type="password" required>
+  <br>
+  <button type="submit">登录</button>
+</form>
+{% endblock %}

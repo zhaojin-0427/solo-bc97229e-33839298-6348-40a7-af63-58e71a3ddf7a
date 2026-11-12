@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}检测明细 - 旧仪器门户{% endblock %}
+{% block body %}
+<h2>检测明细筛选与导出</h2>
+<form method="post" action="{{ url_for('query') }}">
+  <div class="row">
+    <div>
+      <label>产线</label>
+      <select name="line" required>
+        {% for line in lines %}
+        <option value="{{ line }}" {% if result_line == line %}selected{% endif %}>{{ line }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label>日期</label>
+      <input type="date" name="date" value="{{ result_date or '' }}" required>
+    </div>
+    <button type="submit">筛选查询</button>
+  </div>
+</form>
+
+{% if records is defined %}
+<hr style="margin:22px 0;border:0;border-top:1px solid #e5e7eb">
+<h3 style="margin-bottom:4px">查询结果：{{ result_line }} / {{ result_date }}（{{ records|length }} 条）</h3>
+<table>
+  <thead><tr><th>产线</th><th>日期</th><th>样品号</th><th>测量值</th></tr></thead>
+  <tbody>
+  {% for r in records %}
+    <tr><td>{{ r['产线'] }}</td><td>{{ r['日期'] }}</td><td>{{ r['样品号'] }}</td><td>{{ r['测量值'] }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<form method="post" action="{{ url_for('export') }}">
+  <input type="hidden" name="line" value="{{ result_line }}">
+  <input type="hidden" name="date" value="{{ result_date }}">
+  <button type="submit">导出 CSV</button>
+</form>
+{% endif %}
+{% endblock %}

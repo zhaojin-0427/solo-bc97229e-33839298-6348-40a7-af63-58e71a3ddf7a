@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}演示控制台 - 旧仪器门户{% endblock %}
+{% block body %}
+<h2>门户演示控制台</h2>
+<p style="font-size:13px;color:#6b7280">用于演示采集端的取消、校验拦截与重试流程。</p>
+<table style="max-width:560px">
+  <tr><th>当前会话</th><td>
+    {% if state.active_session %}<span class="badge on">有账号在线（单会话占用中）</span>
+    {% else %}<span class="badge off">无活动会话</span>{% endif %}
+  </td></tr>
+</table>
+<form method="post" action="{{ url_for('admin') }}" style="margin-top:18px">
+  <label style="display:block;margin:10px 0">
+    <input type="checkbox" name="delay_export" {% if state.delay_export %}checked{% endif %} style="min-width:0">
+    延迟导出（导出耗时约 8 秒，期间可演示取消）
+  </label>
+  <label style="display:block;margin:10px 0">
+    <input type="checkbox" name="bad_file" {% if state.bad_file %}checked{% endif %} style="min-width:0">
+    返回错误产线文件（CSV 内混入其他产线记录，采集端必须拦截）
+  </label>
+  <button type="submit">保存设置</button>
+</form>
+{% endblock %}

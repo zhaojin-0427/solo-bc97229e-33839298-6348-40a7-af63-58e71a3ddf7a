@@ -1,0 +1,55 @@
+services:
+  # 本地模拟的旧仪器门户
+  portal:
+    build: ./portal
+    environment:
+      PORTAL_USERNAME: admin
+      PORTAL_PASSWORD: instrument123
+      PORTAL_DELAY_EXPORT: "0"
+      PORTAL_BAD_FILE: "0"
+      PORTAL_EXPORT_DELAY: "8"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 独立 Chromium，采集服务经 CDP 连接
+  browser:
+    build: ./browser
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9222/json/version', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # 采集服务（Flask + Playwright + 单线程 worker）
+  collector:
+    build: ./collector
+    depends_on:
+      portal:
+        condition: service_healthy
+      browser:
+        condition: service_healthy
+    environment:
+      PORTAL_URL: http://portal:8000
+      PORTAL_USERNAME: admin
+      PORTAL_PASSWORD: instrument123
+      BROWSER_CDP_URL: http://browser:9222
+      DATA_DIR: /data
+      OPERATION_TIMEOUT_MS: "60000"
+    ports:
+      - "8080:8080"
+    volumes:
+      - collector-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  collector-data:
